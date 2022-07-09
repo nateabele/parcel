@@ -1671,13 +1671,20 @@ export type Optimizer<ConfigType, BundleConfigType> = {|
  */
 export type Compressor = {|
   compress({|
+    contents: Blob,
     stream: Readable,
     options: PluginOptions,
     logger: PluginLogger,
-  |}): Async<?{|
-    stream: Readable,
-    type?: string,
-  |}>,
+  |}): Async<
+    | ?{|
+        stream: Readable,
+        type?: string,
+      |}
+    | {|
+        contents: Blob,
+        type?: string,
+      |},
+  >,
 |};
 
 /**
