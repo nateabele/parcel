@@ -4,9 +4,15 @@ import type {FileSystem} from '@parcel/fs';
 import type {ProgramOptions} from '@parcel/link';
 
 import {createProgram as _createProgram} from '@parcel/link';
-import {workerFarm, inputFS, CopyOnWriteToMemoryFS} from '@parcel/test-utils';
+import {
+  workerFarm,
+  inputFS,
+  fsFixture,
+  CopyOnWriteToMemoryFS,
+} from '@parcel/test-utils';
 
 import assert from 'assert';
+import nullthrows from 'nullthrows';
 import path from 'path';
 import sinon from 'sinon';
 
@@ -20,19 +26,64 @@ function createProgram(opts: {|...ProgramOptions, fs: FileSystem|}) {
   return cli;
 }
 
+function callableProxy(target, handler) {
+  // $FlowFixMe[unclear-type]
+  return new Proxy<any>(handler, {
+    get(_, prop) {
+      let value = Reflect.get(target, prop);
+      if (typeof value === 'function') {
+        return value.bind(target);
+      }
+      return value;
+    },
+  });
+}
+
 describe('@parcel/link', () => {
   let _cwd;
   let _stdout;
 
-  function createFS(dir?: string) {
+  declare function createFS(
+    strings: Array<string>, // $FlowFixMe[unclear-type]
+    ...exprs: Array<any>
+  ): Promise<CopyOnWriteToMemoryFS>;
+
+  declare function createFS(cwd?: string): Promise<CopyOnWriteToMemoryFS> &
+    ((
+      strings: Array<string>, // $FlowFixMe[unclear-type]
+      ...values: Array<any>
+    ) => Promise<CopyOnWriteToMemoryFS>);
+
+  function createFS(cwdOrStrings = '/', ...exprs) {
     assert(_cwd == null, 'FS already exists!');
 
     let fs = new CopyOnWriteToMemoryFS(workerFarm, inputFS);
-    if (dir != null) fs.chdir(dir);
 
     _cwd = sinon.stub(process, 'cwd').callsFake(() => fs.cwd());
 
-    return fs;
+    if (Array.isArray(cwdOrStrings)) {
+      let cwd = '/';
+      return fs.mkdirp(cwd).then(async () => {
+        fs.chdir(cwd);
+        await fsFixture(fs, cwd)(cwdOrStrings, ...exprs);
+        return fs;
+      });
+    } else {
+      let cwd = cwdOrStrings;
+      let promise = fs.mkdirp(cwd).then(() => {
+        fs.chdir(cwd);
+        return callableProxy(fs, async (...args) => {
+          await fsFixture(fs, cwd)(...args);
+          return fs;
+        });
+      });
+
+      return callableProxy(promise, async (...args) => {
+        await promise;
+        await fsFixture(fs, cwd)(...args);
+        return fs;
+      });
+    }
   }
 
   beforeEach(async function () {
@@ -47,7 +98,7 @@ describe('@parcel/link', () => {
   });
 
   it('prints help text', async () => {
-    let fs = createFS();
+    let fs = await createFS();
     let cli = createProgram({fs});
     // $FlowFixMe[prop-missing]
     await assert.rejects(async () => cli('--help'), /\(outputHelp\)/);
@@ -55,7 +106,7 @@ describe('@parcel/link', () => {
 
   it('links by default', async () => {
     let link = sinon.stub();
-    let fs = createFS();
+    let fs = await createFS();
     let cli = createProgram({fs, link});
     await cli();
     assert(link.called);
@@ -63,7 +114,7 @@ describe('@parcel/link', () => {
 
   describe('link', () => {
     it('errors for invalid app root', async () => {
-      let fs = createFS('/app');
+      let fs = await createFS('/app');
 
       let cli = createProgram({fs});
 
@@ -72,8 +123,9 @@ describe('@parcel/link', () => {
     });
 
     it('errors for invalid package root', async () => {
-      let fs = createFS('/app');
-      await fs.writeFile('yarn.lock', '');
+      let fs = await createFS('/app')`yarn.lock:`;
+
+      assert(fs.existsSync('/app/yarn.lock'));
 
       let cli = createProgram({fs});
 
@@ -82,8 +134,7 @@ describe('@parcel/link', () => {
     });
 
     it('errors when a link exists', async () => {
-      let fs = createFS('/app');
-      await fs.writeFile('yarn.lock', '');
+      let fs = await createFS('/app')`yarn.lock:`;
 
       let cli = createProgram({fs});
       await cli(`link`);
@@ -93,10 +144,11 @@ describe('@parcel/link', () => {
     });
 
     it('links with the default options', async () => {
-      let fs = createFS('/app');
-      await fs.writeFile('yarn.lock', '');
-      await fs.mkdirp('node_modules/parcel');
-      await fs.mkdirp('node_modules/@parcel/core');
+      let fs = await createFS('/app')`
+        yarn.lock:
+        node_modules
+          parcel
+          @parcel/core`;
 
       let cli = createProgram({fs});
       await cli('link');
@@ -120,22 +172,20 @@ describe('@parcel/link', () => {
     });
 
     it('links from a custom package root', async () => {
-      let fs = createFS('/app');
-      await fs.writeFile('yarn.lock', '');
-      await fs.mkdirp('node_modules/parcel');
-      await fs.mkdirp('node_modules/@parcel/core');
+      let fs = await createFS`
+        app
+          yarn.lock:
+          node_modules
+            parcel
+            @parcel/core
+        package-root
+          core
+            core/package.json: ${{name: '@parcel/core'}}
+            parcel
+              package.json: ${{name: 'parcel'}}
+              src/bin.js:`;
 
-      await fs.writeFile(
-        '../package-root/core/core/package.json',
-        '{"name": "@parcel/core"}',
-      );
-
-      await fs.writeFile(
-        '../package-root/core/parcel/package.json',
-        '{"name": "parcel"}',
-      );
-
-      await fs.writeFile('../package-root/core/parcel/src/bin.js', '');
+      fs.chdir('/app');
 
       let cli = createProgram({fs});
       await cli(`link ../package-root`);
@@ -159,10 +209,12 @@ describe('@parcel/link', () => {
     });
 
     it('links with a custom namespace', async () => {
-      let fs = createFS('/app');
-      await fs.writeFile('yarn.lock', '');
-      await fs.mkdirp('node_modules/@namespace/parcel');
-      await fs.mkdirp('node_modules/@namespace/parcel-core');
+      let fs = await createFS('/app')`
+        yarn.lock:
+        node_modules
+          @namespace
+            parcel
+            parcel-core`;
 
       let cli = createProgram({fs});
       await cli('link --namespace @namespace');
@@ -196,34 +248,27 @@ describe('@parcel/link', () => {
     });
 
     it('updates config for custom namespace', async () => {
-      let fs = createFS('/app');
-      await fs.writeFile('yarn.lock', '');
+      let fs = await createFS`
+        ${path.join(__dirname, '../../../configs/namespace/package.json')}: ${{
+        name: '@parcel/config-namespace',
+      }}
+        app
+          yarn.lock:
+          .parcelrc: ${{
+            extends: '@namespace/parcel-config-namespace',
+            transformers: {
+              '*': [
+                '@namespace/parcel-transformer-js',
+                '@namespace/parcel-transformer-local',
+              ],
+            },
+          }}
+          package.json: ${{
+            ['@namespace/parcel-transformer-js']: {},
+            ['@namespace/parcel-transformer-local']: {},
+          }}`;
 
-      await fs.writeFile(
-        '.parcelrc',
-        JSON.stringify({
-          extends: '@namespace/parcel-config-namespace',
-          transformers: {
-            '*': [
-              '@namespace/parcel-transformer-js',
-              '@namespace/parcel-transformer-local',
-            ],
-          },
-        }),
-      );
-
-      await fs.writeFile(
-        'package.json',
-        JSON.stringify({
-          ['@namespace/parcel-transformer-js']: {},
-          ['@namespace/parcel-transformer-local']: {},
-        }),
-      );
-
-      await fs.writeFile(
-        path.join(__dirname, '../../../configs/namespace/package.json'),
-        '{"name": "@parcel/config-namespace"}',
-      );
+      fs.chdir('/app');
 
       let cli = createProgram({fs});
       await cli('link --namespace @namespace');
@@ -253,10 +298,11 @@ describe('@parcel/link', () => {
     });
 
     it('links with custom node modules glob', async () => {
-      let fs = createFS('/app');
-      await fs.writeFile('yarn.lock', '');
-      await fs.mkdirp('tools/test/node_modules/parcel');
-      await fs.mkdirp('tools/test2/node_modules/@parcel/core');
+      let fs = await createFS('/app')`
+        yarn.lock:
+        tools
+          test/node_modules/parcel
+          test2/node_modules/@parcel/core`;
 
       let cli = createProgram({fs});
       await cli('link --node-modules-glob "tools/*/node_modules"');
@@ -286,10 +332,11 @@ describe('@parcel/link', () => {
     });
 
     it('does not do anything with dry run', async () => {
-      let fs = createFS('/app');
-      await fs.writeFile('yarn.lock', '');
-      await fs.mkdirp('node_modules/parcel');
-      await fs.mkdirp('node_modules/@parcel/core');
+      let fs = await createFS('/app')`
+        yarn.lock:
+        node_modules
+          parcel
+          @parcel/core`;
 
       let cli = createProgram({fs});
       await cli('link --dry-run');
@@ -312,8 +359,7 @@ describe('@parcel/link', () => {
 
   describe('unlink', () => {
     it('errors without a link config', async () => {
-      let fs = createFS('/app');
-      await fs.writeFile('yarn.lock', '');
+      let fs = await createFS('/app')`yarn.lock:`;
 
       let cli = createProgram({fs});
 
@@ -325,17 +371,14 @@ describe('@parcel/link', () => {
     });
 
     it('errors for invalid app root', async () => {
-      let fs = createFS('/app');
-      await fs.writeFile('yarn.lock', '');
-      await fs.writeFile(
-        '.parcel-link',
-        JSON.stringify({
+      let fs = await createFS('/app')`
+        yarn.lock:
+        .parcel-link: ${{
           appRoot: '/app2',
           packageRoot: path.resolve(__dirname, '../../..'),
           nodeModulesGlobs: ['node_modules'],
           namespace: '@parcel',
-        }),
-      );
+        }}`;
 
       let cli = createProgram({fs});
 
@@ -344,17 +387,14 @@ describe('@parcel/link', () => {
     });
 
     it('errors for invalid package root', async () => {
-      let fs = createFS('/app');
-      await fs.writeFile('yarn.lock', '');
-      await fs.writeFile(
-        '.parcel-link',
-        JSON.stringify({
+      let fs = await createFS('/app')`
+        yarn.lock:
+        .parcel-link: ${{
           appRoot: '/app',
           packageRoot: path.resolve(__dirname, '../../..') + '2',
           nodeModulesGlobs: ['node_modules'],
           namespace: '@parcel',
-        }),
-      );
+        }}`;
 
       let cli = createProgram({fs});
 
@@ -363,33 +403,23 @@ describe('@parcel/link', () => {
     });
 
     it('unlinks with the default options', async () => {
-      let fs = createFS('/app');
-      await fs.writeFile('yarn.lock', '');
-
-      await fs.symlink(
-        path.resolve(__dirname, '../../parcel'),
-        'node_modules/parcel',
-      );
-
-      await fs.symlink(
-        path.resolve(__dirname, '../../core'),
-        'node_modules/@parcel/core',
-      );
-
-      await fs.symlink(
-        path.resolve(__dirname, '../../parcel/src/bin.js'),
-        'node_modules/.bin/parcel',
-      );
-
-      await fs.writeFile(
-        '.parcel-link',
-        JSON.stringify({
+      let fs = await createFS('/app')`
+        yarn.lock:
+        node_modules
+          .bin/parcel -> ${path.resolve(__dirname, '../../parcel/src/bin.js')}
+          parcel -> ${path.resolve(__dirname, '../../parcel')}
+          @parcel/core -> ${path.resolve(__dirname, '../../core')}
+        .parcel-link: ${{
           appRoot: '/app',
           packageRoot: path.resolve(__dirname, '../../..'),
           nodeModulesGlobs: ['node_modules'],
           namespace: '@parcel',
-        }),
-      );
+        }}`;
+
+      assert(fs.existsSync('.parcel-link'));
+      assert(fs.existsSync('node_modules/@parcel/core'));
+      assert(fs.existsSync('node_modules/parcel'));
+      assert(fs.existsSync('node_modules/.bin/parcel'));
 
       let cli = createProgram({fs});
       await cli('unlink');
@@ -401,39 +431,22 @@ describe('@parcel/link', () => {
     });
 
     it('unlinks from a custom package root', async () => {
-      let fs = createFS('/app');
-      await fs.writeFile('yarn.lock', '');
-
-      await fs.writeFile(
-        '../package-root/core/core/package.json',
-        '{"name": "@parcel/core"}',
-      );
-
-      await fs.writeFile(
-        '../package-root/core/parcel/package.json',
-        '{"name": "parcel"}',
-      );
-
-      await fs.writeFile('../package-root/core/parcel/src/bin.js', '');
-
-      await fs.symlink('/package-root/core/parcel', 'node_modules/parcel');
-
-      await fs.symlink('/package-root/core/core', 'node_modules/@parcel/core');
-
-      await fs.symlink(
-        '/package-root/core/parcel/src/bin.js',
-        'node_modules/.bin/parcel',
-      );
-
-      await fs.writeFile(
-        '.parcel-link',
-        JSON.stringify({
+      let fs = await createFS('/app')`
+        yarn.lock:
+        .parcel-link: ${{
           appRoot: '/app',
           packageRoot: '/package-root',
           nodeModulesGlobs: ['node_modules'],
           namespace: '@parcel',
-        }),
-      );
+        }}
+        node_modules/parcel -> package-root/core/parcel
+        node_modules/@parcel/core -> package-root/core/core
+        node_modules/.bin/parcel -> package-root/core/parcel/src/bin.js`;
+
+      await fsFixture(fs, '/')`
+        package-root/core/core/package.json: ${{name: '@parcel/core'}}
+        package-root/core/parcel/package.json: ${{name: 'parcel'}}
+        package-root/core/parcel/src/bin.js:`;
 
       let cli = createProgram({fs});
       await cli('unlink');
@@ -445,42 +458,20 @@ describe('@parcel/link', () => {
     });
 
     it('unlinks with a custom namespace', async () => {
-      let fs = createFS('/app');
-      await fs.writeFile('yarn.lock', '');
-
-      await fs.symlink(
-        path.resolve(__dirname, '../../parcel'),
-        'node_modules/parcel',
-      );
-      await fs.symlink(
-        path.resolve(__dirname, '../../parcel'),
-        'node_modules/@namespace/parcel',
-      );
-
-      await fs.symlink(
-        path.resolve(__dirname, '../../core'),
-        'node_modules/@parcel/core',
-      );
-
-      await fs.symlink(
-        path.resolve(__dirname, '../../core'),
-        'node_modules/@namespace/parcel-core',
-      );
-
-      await fs.symlink(
-        path.resolve(__dirname, '../../parcel/src/bin.js'),
-        'node_modules/.bin/parcel',
-      );
-
-      await fs.writeFile(
-        '.parcel-link',
-        JSON.stringify({
+      let fs = await createFS('/app')`
+        yarn.lock:
+        .parcel-link: ${{
           appRoot: '/app',
           packageRoot: path.resolve(__dirname, '../../..'),
           nodeModulesGlobs: ['node_modules'],
           namespace: '@namespace',
-        }),
-      );
+        }}
+        node_modules
+          .bin/parcel -> ${path.resolve(__dirname, '../../parcel/src/bin.js')}
+          parcel -> ${path.resolve(__dirname, '../../parcel')}
+          @namespace/parcel -> ${path.resolve(__dirname, '../../parcel')}
+          parcel/core -> ${path.resolve(__dirname, '../../core')}
+          @namespace/parcel-core -> ${path.resolve(__dirname, '../../core')}`;
 
       let cli = createProgram({fs});
       await cli('unlink');
@@ -494,12 +485,9 @@ describe('@parcel/link', () => {
     });
 
     it('updates config for custom namespace', async () => {
-      let fs = createFS('/app');
-      await fs.writeFile('yarn.lock', '');
-
-      await fs.writeFile(
-        '.parcelrc',
-        JSON.stringify({
+      let fs = await createFS('/app')`
+        yarn.lock:
+        .parcelrc: ${{
           extends: '@parcel/config-namespace',
           transformers: {
             '*': [
@@ -507,31 +495,22 @@ describe('@parcel/link', () => {
               '@namespace/parcel-transformer-local',
             ],
           },
-        }),
-      );
-
-      await fs.writeFile(
-        'package.json',
-        JSON.stringify({
+        }}
+        package.json: ${{
           ['@parcel/transformer-js']: {},
           ['@namespace/parcel-transformer-local']: {},
-        }),
-      );
-
-      await fs.writeFile(
-        path.join(__dirname, '../../../configs/namespace/package.json'),
-        '{"name": "@parcel/config-namespace"}',
-      );
-
-      await fs.writeFile(
-        '.parcel-link',
-        JSON.stringify({
+        }}
+        .parcel-link: ${{
           appRoot: '/app',
           packageRoot: path.resolve(__dirname, '../../..'),
           nodeModulesGlobs: ['node_modules'],
           namespace: '@namespace',
-        }),
-      );
+        }}`;
+
+      await fsFixture(fs, '/')`
+        ${path.join(__dirname, '../../../configs/namespace/package.json')}: ${{
+        name: '@parcel/config-namespace',
+      }}`;
 
       let cli = createProgram({fs});
       await cli('unlink');
@@ -561,43 +540,24 @@ describe('@parcel/link', () => {
     });
 
     it('unlinks with custom node modules glob', async () => {
-      let fs = createFS('/app');
-      await fs.writeFile('yarn.lock', '');
-
-      await fs.symlink(
-        path.resolve(__dirname, '../../parcel'),
-        'node_modules/parcel',
-      );
-
-      await fs.symlink(
-        path.resolve(__dirname, '../../core'),
-        'node_modules/@parcel/core',
-      );
-
-      await fs.symlink(
-        path.resolve(__dirname, '../../parcel/src/bin.js'),
-        'node_modules/.bin/parcel',
-      );
-
-      await fs.symlink(
-        path.resolve(__dirname, '../../parcel'),
-        'tools/test/node_modules/parcel',
-      );
-
-      await fs.symlink(
-        path.resolve(__dirname, '../../core'),
-        'tools/test2/node_modules/@parcel/core',
-      );
-
-      await fs.writeFile(
-        '.parcel-link',
-        JSON.stringify({
+      let fs = await createFS('/app')`
+        yarn.lock:
+        .parcel-link: ${{
           appRoot: '/app',
           packageRoot: path.resolve(__dirname, '../../..'),
           nodeModulesGlobs: ['node_modules', 'tools/*/node_modules'],
           namespace: '@parcel',
-        }),
-      );
+        }}
+        node_modules
+          parcel -> ${path.resolve(__dirname, '../../parcel')}
+          @parcel/core -> ${path.resolve(__dirname, '../../core')}
+          .bin/parcel -> ${path.resolve(__dirname, '../../parcel/src/bin.js')}
+        tools
+          test/node_modules/parcel -> ${path.resolve(__dirname, '../../parcel')}
+          test2/node_modules/@parcel/core -> ${path.resolve(
+            __dirname,
+            '../../core',
+          )}`;
 
       let cli = createProgram({fs});
       await cli('unlink');
@@ -611,33 +571,19 @@ describe('@parcel/link', () => {
     });
 
     it('does not do anything with dry run', async () => {
-      let fs = createFS('/app');
-      await fs.writeFile('yarn.lock', '');
-
-      await fs.symlink(
-        path.resolve(__dirname, '../../parcel'),
-        'node_modules/parcel',
-      );
-
-      await fs.symlink(
-        path.resolve(__dirname, '../../core'),
-        'node_modules/@parcel/core',
-      );
-
-      await fs.symlink(
-        path.resolve(__dirname, '../../parcel/src/bin.js'),
-        'node_modules/.bin/parcel',
-      );
-
-      await fs.writeFile(
-        '.parcel-link',
-        JSON.stringify({
+      let fs = await createFS('/app')`
+        yarn.lock:
+        node_modules
+          .bin/parcel -> ${path.resolve(__dirname, '../../parcel/src/bin.js')}
+          parcel -> ${path.resolve(__dirname, '../../parcel')}
+          @parcel/core -> ${path.resolve(__dirname, '../../core')}
+        .parcel-link: ${{
           appRoot: '/app',
           packageRoot: path.resolve(__dirname, '../../..'),
           nodeModulesGlobs: ['node_modules'],
           namespace: '@parcel',
-        }),
-      );
+        }}
+      `;
 
       let cli = createProgram({fs});
       await cli('unlink --dry-run');
