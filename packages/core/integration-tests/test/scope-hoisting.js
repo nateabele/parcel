@@ -397,6 +397,18 @@ describe('scope hoisting', function () {
       assert.equal(output, 15);
     });
 
+    it('supports re-exporting all exports and overriding individual exports', async function () {
+      let b = await bundle(
+        path.join(
+          __dirname,
+          '/integration/scope-hoisting/es6/re-export-all-override/index.js',
+        ),
+      );
+
+      let output = await run(b);
+      assert.strictEqual(output, 'fooBfooCC');
+    });
+
     it('can import from a different bundle via a re-export (1)', async function () {
       let b = await bundle(
         path.join(
@@ -2224,6 +2236,17 @@ describe('scope hoisting', function () {
       ]);
     });
 
+    it('should correctly retarget dependencies when both namespace and indvidual export are used', async function () {
+      let b = await bundle(
+        path.join(
+          __dirname,
+          '/integration/scope-hoisting/es6/retarget-namespace-single/index.js',
+        ),
+      );
+      let output = await run(b);
+      assert.deepEqual(output, [123, 123]);
+    });
+
     it('should correctly handle circular dependencies', async function () {
       let b = await bundle(
         path.join(__dirname, '/integration/scope-hoisting/es6/circular/a.mjs'),
@@ -3810,8 +3833,8 @@ describe('scope hoisting', function () {
         ),
       );
 
-      let output = await run(b);
-      assert.strictEqual(output, 2);
+      let output = await run(b, {output: null}, {strict: true});
+      assert.deepEqual(output, [6, undefined]);
     });
 
     it('supports assigning to this as exports object in wrapped module', async function () {
@@ -3822,8 +3845,8 @@ describe('scope hoisting', function () {
         ),
       );
 
-      let output = await run(b);
-      assert.strictEqual(output, 6);
+      let output = await run(b, {output: null}, {strict: true});
+      assert.deepEqual(output, [6, undefined, 4]);
     });
 
     it('supports using exports self reference', async function () {
@@ -5562,5 +5585,17 @@ describe('scope hoisting', function () {
     } finally {
       await workerFarm.end();
     }
+
+    it('should not deduplicate an asset if it will become unreachable', async function () {
+      let b = await bundle(
+        path.join(
+          __dirname,
+          'integration/sibling-deduplicate-unreachable/index.js',
+        ),
+        {mode: 'production'},
+      );
+      let res = await run(b);
+      assert.equal(res, 'target');
+    });
   });
 });
