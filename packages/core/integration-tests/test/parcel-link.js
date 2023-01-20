@@ -212,6 +212,7 @@ describe('@parcel/link', () => {
       let fs = await createFS('/app')`
         yarn.lock:
         node_modules
+          .bin/parcel:
           @namespace
             parcel
             parcel-core`;
@@ -220,6 +221,11 @@ describe('@parcel/link', () => {
       await cli('link --namespace @namespace');
 
       assert(fs.existsSync('.parcel-link'));
+
+      assert.equal(
+        fs.realpathSync('node_modules/.bin/parcel'),
+        path.resolve(__dirname, '../../parcel/src/bin.js'),
+      );
 
       assert.equal(
         fs.realpathSync('node_modules/@namespace/parcel-core'),
